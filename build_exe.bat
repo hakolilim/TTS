@@ -12,13 +12,16 @@ python -m PyInstaller --noconfirm --clean --onefile --windowed ^
   --add-data "app.ico;." ^
   --collect-all customtkinter ^
   --collect-all edge_tts ^
+  --collect-all pygame ^
   --hidden-import edge_tts ^
   --hidden-import aiohttp ^
   --hidden-import certifi ^
   --hidden-import darkdetect ^
   --hidden-import PIL ^
   --hidden-import pydub ^
+  --hidden-import pygame ^
   main.py
+
 
 if errorlevel 1 (
   echo BUILD FAILED

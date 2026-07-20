@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import random
 import tempfile
 import threading
 import time
@@ -12,13 +13,19 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
 
-
 from app.sentence_splitter import Sentence
 
 # Reject empty / truncated edge-tts responses (common cause of stuck live playback).
-MIN_AUDIO_BYTES = 5
-MAX_SYNTH_RETRIES = 3
-RETRY_BASE_DELAY_S = 0.35
+MIN_AUDIO_BYTES = 128
+MAX_SYNTH_RETRIES = 5
+RETRY_BASE_DELAY_S = 0.6
+# Per-attempt network/stream hang protection — without this, retry never runs.
+SYNTH_TIMEOUT_S = 45.0
+# Absolute ceiling while waiting for player on_complete (avoids infinite hang).
+PLAYBACK_WAIT_MIN_S = 20.0
+PLAYBACK_WAIT_SLACK_S = 15.0
+# Rough speech MP3 bitrate for wait estimate (bits/s).
+PLAYBACK_EST_BITRATE = 24_000
 
 
 class PipelineMode(str, Enum):
@@ -39,7 +46,7 @@ class TTSPipeline:
 
     LIVE mode prefetches upcoming *batches* (default 3 sentences per edge-tts
     request) while the current batch is playing, so transitions are nearly seamless.
-    Live audio is held in RAM; only a single play-temp file is written for MCI.
+    Live audio is held entirely in RAM and handed to the player as bytes (pygame-ce).
     """
 
     def __init__(
@@ -52,11 +59,9 @@ class TTSPipeline:
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         self.prefetch_ahead = max(1, prefetch_ahead)
         self.sentences_per_request = max(1, sentences_per_request)
-        # Single on-disk slot for the batch currently being played (MCI needs a path).
-        self._play_path = str(self.temp_dir / "play_current.mp3")
-
 
         self._state = PipelineState.IDLE
+
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._pause_event = threading.Event()
@@ -74,17 +79,23 @@ class TTSPipeline:
 
         # Callbacks (worker thread — GUI must marshal to main thread)
         # Live: start/end are sentence indices [start, end) for the current batch.
+        # on_sentence_ready receives MP3 bytes (RAM) for pygame-ce playback.
         self.on_sentence_start: Optional[Callable[[int, int], None]] = None
-        self.on_sentence_ready: Optional[Callable[[int, int, str], None]] = None
+        self.on_sentence_ready: Optional[Callable[[int, int, bytes], None]] = None
+
         self.on_progress: Optional[Callable[[int, int], None]] = None
         self.on_export_done: Optional[Callable[[str], None]] = None
         self.on_done: Optional[Callable[[], None]] = None
         self.on_error: Optional[Callable[[str], None]] = None
+        self.on_status: Optional[Callable[[str], None]] = None
         self.on_state_change: Optional[Callable[[str], None]] = None
 
         # LIVE: wait until player finishes current batch audio
         self._playback_done = threading.Event()
         self._playback_done.set()
+
+        # Adaptive prefetch: shrink when edge-tts rate-limits / fails often
+        self._consecutive_failures = 0
 
     @property
     def state(self) -> PipelineState:
@@ -95,6 +106,20 @@ class TTSPipeline:
         if self.on_state_change:
             try:
                 self.on_state_change(state.value)
+            except Exception:
+                pass
+
+    def _emit_status(self, msg: str) -> None:
+        if self.on_status:
+            try:
+                self.on_status(msg)
+            except Exception:
+                pass
+
+    def _emit_error(self, msg: str) -> None:
+        if self.on_error:
+            try:
+                self.on_error(msg)
             except Exception:
                 pass
 
@@ -125,6 +150,7 @@ class TTSPipeline:
             self._seek_to = None
             self._pause_event.set()
             self._playback_done.set()
+            self._consecutive_failures = 0
             self._set_state(PipelineState.RUNNING)
 
             self._thread = threading.Thread(target=self._run_worker, daemon=True)
@@ -173,11 +199,7 @@ class TTSPipeline:
             else:
                 asyncio.run(self._live_loop())
         except Exception as e:
-            if self.on_error:
-                try:
-                    self.on_error(str(e))
-                except Exception:
-                    pass
+            self._emit_error(str(e))
         finally:
             self._set_state(PipelineState.IDLE)
             if not self._stop_flag and self.on_done:
@@ -195,29 +217,54 @@ class TTSPipeline:
         )
         buf = bytearray()
         async for chunk in communicate.stream():
+            if self._stop_flag:
+                raise asyncio.CancelledError()
             if chunk["type"] == "audio":
                 buf.extend(chunk["data"])
         return bytes(buf)
 
     async def _synthesize_to_bytes_with_retry(self, text: str, label: str) -> bytes:
-        """Synthesize with retries when response is empty/too small or network fails."""
+        """Synthesize with retries when hang/timeout, empty audio, or network fails."""
         last_err: Optional[BaseException] = None
         for attempt in range(1, MAX_SYNTH_RETRIES + 1):
             if self._stop_flag:
                 raise asyncio.CancelledError()
             try:
-                data = await self._synthesize_to_bytes(text)
+                if attempt > 1:
+                    self._emit_status(
+                        f"Đang thử lại {label} (lần {attempt}/{MAX_SYNTH_RETRIES})..."
+                    )
+                data = await asyncio.wait_for(
+                    self._synthesize_to_bytes(text),
+                    timeout=SYNTH_TIMEOUT_S,
+                )
                 if len(data) < MIN_AUDIO_BYTES:
                     raise RuntimeError(
                         f"audio rỗng/quá nhỏ ({len(data)} bytes, min {MIN_AUDIO_BYTES})"
                     )
+                self._consecutive_failures = 0
                 return data
             except asyncio.CancelledError:
                 raise
+            except asyncio.TimeoutError as e:
+                last_err = TimeoutError(
+                    f"timeout sau {SYNTH_TIMEOUT_S:.0f}s (mạng/edge-tts treo)"
+                )
+                # Treat as retriable failure
+                _ = e
             except Exception as e:
                 last_err = e
-                if attempt < MAX_SYNTH_RETRIES and not self._stop_flag:
-                    await asyncio.sleep(RETRY_BASE_DELAY_S * attempt)
+
+            if attempt < MAX_SYNTH_RETRIES and not self._stop_flag:
+                # Exponential backoff + small jitter (helps rate-limit recovery)
+                delay = RETRY_BASE_DELAY_S * (2 ** (attempt - 1))
+                delay = min(delay, 8.0) + random.uniform(0.0, 0.35)
+                self._emit_status(
+                    f"Lỗi {label}: {last_err}. Chờ {delay:.1f}s rồi thử lại..."
+                )
+                await asyncio.sleep(delay)
+
+        self._consecutive_failures += 1
         raise RuntimeError(
             f"{label}: thất bại sau {MAX_SYNTH_RETRIES} lần thử — {last_err}"
         )
@@ -239,43 +286,9 @@ class TTSPipeline:
             self._safe_unlink(out_path)
             raise RuntimeError(f"Ghi file thất bại hoặc file rỗng: {out_path}")
 
-
     def _temp_file(self, suffix: str = ".mp3") -> str:
         name = f"tts_{uuid.uuid4().hex}{suffix}"
         return str(self.temp_dir / name)
-
-    def _materialize_play_file(self, data: bytes) -> str:
-        """Write RAM audio to the single play-temp path for MCI/pygame.
-
-        Retries briefly if Windows still holds a lock on the previous play file.
-        """
-        path = self._play_path
-        tmp_path = path + ".part"
-        last_err: Optional[BaseException] = None
-        for attempt in range(5):
-            try:
-                with open(tmp_path, "wb") as f:
-                    f.write(data)
-                # Prefer replace; if locked, try unlink + rename
-                try:
-                    os.replace(tmp_path, path)
-                except OSError:
-                    self._safe_unlink(path)
-                    os.replace(tmp_path, path)
-                if os.path.isfile(path) and os.path.getsize(path) >= MIN_AUDIO_BYTES:
-                    return path
-                last_err = RuntimeError("file phát tạm rỗng sau khi ghi")
-                time.sleep(0.05 * (attempt + 1))
-            except OSError as e:
-                last_err = e
-                # Tiny blocking wait: Windows may still hold MCI lock on previous play file.
-                time.sleep(0.05 * (attempt + 1))
-            finally:
-                self._safe_unlink(tmp_path)
-
-        self._safe_unlink(path)
-        raise RuntimeError(f"Không tạo được file phát tạm: {last_err}")
-
 
     # ── Batch helpers ─────────────────────────────────────────────
 
@@ -294,6 +307,14 @@ class TTSPipeline:
             return f"câu {start + 1}"
         return f"câu {start + 1}–{end}"
 
+    def _effective_prefetch_ahead(self) -> int:
+        """Reduce parallel requests after repeated failures (rate-limit friendly)."""
+        if self._consecutive_failures >= 3:
+            return 1
+        if self._consecutive_failures >= 1:
+            return max(1, min(self.prefetch_ahead, 1))
+        return self.prefetch_ahead
+
     # ── Prefetch buffer helpers (LIVE: cache holds MP3 bytes in RAM) ──
 
     def _clear_cache(
@@ -305,6 +326,60 @@ class TTSPipeline:
         for idx in list(cache.keys()):
             if idx not in keep:
                 cache.pop(idx, None)
+
+    async def _synthesize_batch_or_fallback(self, start: int, end: int, label: str) -> bytes:
+        """
+        Try whole-batch synth first. On failure (and batch has >1 sentence),
+        fall back to per-sentence synth and binary-concatenate MP3 frames.
+        """
+        text = self._batch_text(start, end)
+        if not text:
+            raise RuntimeError(f"{label}: không có nội dung")
+
+        try:
+            return await self._synthesize_to_bytes_with_retry(text, label)
+        except asyncio.CancelledError:
+            raise
+        except Exception as batch_err:
+            if end - start <= 1:
+                raise
+
+            self._emit_status(
+                f"Batch {label} lỗi ({batch_err}). Đang fallback từng câu..."
+            )
+            parts: List[bytes] = []
+            failed: List[str] = []
+            for idx in range(start, end):
+                if self._stop_flag:
+                    raise asyncio.CancelledError()
+                piece = self.sentences[idx].text.strip()
+                if not piece:
+                    continue
+                sent_label = f"câu {idx + 1}"
+                try:
+                    data = await self._synthesize_to_bytes_with_retry(piece, sent_label)
+                    parts.append(data)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    failed.append(f"{sent_label}: {e}")
+                    self._emit_error(f"Bỏ qua {sent_label}: {e}")
+
+            if not parts:
+                raise RuntimeError(
+                    f"{label}: fallback từng câu cũng thất bại — "
+                    + ("; ".join(failed) if failed else str(batch_err))
+                )
+
+            # Same-encoder MPEG frames usually play fine when concatenated.
+            combined = b"".join(parts)
+            if len(combined) < MIN_AUDIO_BYTES:
+                raise RuntimeError(f"{label}: audio fallback quá nhỏ")
+            if failed:
+                self._emit_status(
+                    f"{label}: đã ghép {len(parts)} câu, bỏ qua {len(failed)} câu lỗi"
+                )
+            return combined
 
     async def _ensure_cached(
         self,
@@ -339,7 +414,7 @@ class TTSPipeline:
         label = self._batch_label(start, end)
 
         async def _job() -> bytes:
-            data = await self._synthesize_to_bytes_with_retry(text, label)
+            data = await self._synthesize_batch_or_fallback(start, end, label)
             cache[start] = data
             return data
 
@@ -350,16 +425,11 @@ class TTSPipeline:
             return data
         except Exception as e:
             cache.pop(start, None)
-            if self.on_error:
-                try:
-                    self.on_error(f"Lỗi chuyển {label}: {e}")
-                except Exception:
-                    pass
+            self._emit_error(f"Lỗi chuyển {label}: {e}")
             return None
         finally:
             if inflight.get(start) is task:
                 inflight.pop(start, None)
-
 
     def _schedule_prefetch(
         self,
@@ -370,7 +440,8 @@ class TTSPipeline:
     ) -> None:
         """Kick off background synth for the next N batches (non-blocking, RAM cache)."""
         batch_size = self.sentences_per_request
-        for b in range(self.prefetch_ahead):
+        ahead = self._effective_prefetch_ahead()
+        for b in range(ahead):
             start = from_index + b * batch_size
             if start >= total:
                 break
@@ -384,10 +455,10 @@ class TTSPipeline:
 
             async def _job(
                 idx: int = start,
-                payload: str = text,
+                batch_end: int = end,
                 lbl: str = label,
             ) -> bytes:
-                data = await self._synthesize_to_bytes_with_retry(payload, lbl)
+                data = await self._synthesize_batch_or_fallback(idx, batch_end, lbl)
                 cache[idx] = data
                 return data
 
@@ -408,14 +479,9 @@ class TTSPipeline:
                     cache.pop(idx, None)
                 except Exception as e:
                     cache.pop(idx, None)
-                    if self.on_error:
-                        try:
-                            self.on_error(f"Lỗi chuyển {lbl}: {e}")
-                        except Exception:
-                            pass
+                    self._emit_error(f"Lỗi chuyển {lbl}: {e}")
 
             task.add_done_callback(_done)
-
 
     async def _cancel_inflight(self, inflight: Dict[int, asyncio.Task]) -> None:
         tasks = list(inflight.values())
@@ -425,18 +491,47 @@ class TTSPipeline:
             await asyncio.gather(*tasks, return_exceptions=True)
         inflight.clear()
 
+    def _playback_wait_timeout_s(self, data: bytes) -> float:
+        """Upper bound for waiting on player on_complete for this audio blob."""
+        # duration ≈ size*8 / bitrate; add slack for decode/start latency
+        est = (len(data) * 8.0) / float(PLAYBACK_EST_BITRATE)
+        return max(PLAYBACK_WAIT_MIN_S, est + PLAYBACK_WAIT_SLACK_S)
+
+    async def _wait_playback(self, data: bytes) -> bool:
+        """
+        Wait until playback done, stop, seek, or timeout.
+        Returns True if finished normally (or timed out after force-continue).
+        Returns False if stop/seek interrupted.
+        """
+        timeout_s = self._playback_wait_timeout_s(data)
+        deadline = time.monotonic() + timeout_s
+        while not self._playback_done.is_set():
+            if self._stop_flag or self._seek_to is not None:
+                return False
+            if time.monotonic() >= deadline:
+                self._emit_error(
+                    f"Phát audio quá lâu (>{timeout_s:.0f}s) — bỏ qua đoạn hiện tại"
+                )
+                self._playback_done.set()
+                return True
+            # Keep event loop free so prefetch tasks progress
+            await asyncio.sleep(0.03)
+        return True
+
     async def _live_loop(self) -> None:
         """
         Producer-consumer live loop:
         - Prefetch next batches into RAM while current one plays
         - Each batch (default 3 sentences) = one edge-tts request
-        - Only materialize one play-temp file for the player (MCI needs a path)
+        - Hand MP3 bytes to player (pygame-ce) — no disk I/O for live audio
+        - On batch failure: fallback per-sentence; never hang forever on synth/play
         """
         total = len(self.sentences)
         i = self.current_index
         cache: Dict[int, bytes] = {}
         inflight: Dict[int, asyncio.Task] = {}
         batch_size = self.sentences_per_request
+        skipped_batches = 0
 
         try:
             # Warm up: start synth for first batch + lookahead immediately
@@ -481,9 +576,13 @@ class TTSPipeline:
                     except Exception:
                         pass
 
-                # Ensure this batch audio is ready in RAM
+                # Ensure this batch audio is ready in RAM (with retry + fallback)
                 data = await self._ensure_cached(i, end, cache, inflight)
                 if not data:
+                    skipped_batches += 1
+                    self._emit_status(
+                        f"Bỏ qua {self._batch_label(i, end)} sau khi retry/fallback thất bại"
+                    )
                     i = end
                     self._schedule_prefetch(i, total, cache, inflight)
                     continue
@@ -496,69 +595,52 @@ class TTSPipeline:
                 # Prefetch further batches while we play this one
                 self._schedule_prefetch(i + batch_size, total, cache, inflight)
 
-                # Materialize single play file from RAM for MCI
-                try:
-                    play_path = self._materialize_play_file(data)
-                except Exception as e:
-                    if self.on_error:
-                        try:
-                            self.on_error(f"Lỗi ghi file phát: {e}")
-                        except Exception:
-                            pass
-                    cache.pop(i, None)
-                    i = end
-                    self._schedule_prefetch(i, total, cache, inflight)
-                    continue
-
-                # Hand off to player
+                # Hand bytes to player (GUI → pygame-ce BytesIO)
                 self._playback_done.clear()
                 if self.on_sentence_ready:
                     try:
-                        self.on_sentence_ready(i, end, play_path)
+                        self.on_sentence_ready(i, end, data)
                     except Exception as e:
-                        if self.on_error:
-                            self.on_error(str(e))
+                        self._emit_error(str(e))
                         self._playback_done.set()
 
-                # Wait until playback done, stop, or seek
-                while not self._playback_done.is_set():
-                    if self._stop_flag or self._seek_to is not None:
-                        break
-                    # Keep event loop free so prefetch tasks progress
-                    await asyncio.sleep(0.03)
+                # Wait until playback done, stop, seek, or timeout
+                ok = await self._wait_playback(data)
 
-                # Drop consumed batch from RAM cache; release play file after MCI unlock
                 cache.pop(i, None)
-                await asyncio.sleep(0.02)
-                self._safe_unlink(self._play_path)
 
                 if self._stop_flag:
                     break
                 if self._seek_to is not None:
+                    continue
+                if not ok:
+                    # Interrupted by stop/seek path above; loop handles flags
                     continue
 
                 i = end
                 self.current_index = i
                 # Drop cache entries far behind (keep only upcoming batch starts)
                 keep: Set[int] = set()
-                for b in range(self.prefetch_ahead + 1):
+                ahead = self._effective_prefetch_ahead()
+                for b in range(ahead + 1):
                     s = i + b * batch_size
                     if s < total:
                         keep.add(s)
                 self._clear_cache(cache, keep=keep)
                 self._schedule_prefetch(i, total, cache, inflight)
+
+            if skipped_batches and not self._stop_flag:
+                self._emit_status(
+                    f"Hoàn tất với {skipped_batches} batch bị bỏ qua do lỗi mạng/TTS"
+                )
         finally:
             await self._cancel_inflight(inflight)
             self._clear_cache(cache)
-            self._safe_unlink(self._play_path)
-            self._safe_unlink(self._play_path + ".part")
-
 
     async def _export_loop(self) -> None:
         total = len(self.sentences)
         if total == 0:
-            if self.on_error:
-                self.on_error("Không có đoạn audio nào được tạo.")
+            self._emit_error("Không có đoạn audio nào được tạo.")
             return
 
         batch_size = self.sentences_per_request
@@ -567,6 +649,7 @@ class TTSPipeline:
         # Parallel export with limited concurrency for speed
         sem = asyncio.Semaphore(3)
         results: Dict[int, str] = {}
+        failures: List[str] = []
 
         async def synth_batch(start: int) -> None:
             async with sem:
@@ -579,13 +662,47 @@ class TTSPipeline:
                 out_path = self._temp_file()
                 label = self._batch_label(start, end)
                 try:
-                    await self._synthesize_to_file(text, out_path, label=label)
+                    # Prefer whole-batch write; on fail fall back sentence-by-sentence
+                    try:
+                        await self._synthesize_to_file(text, out_path, label=label)
+                    except Exception:
+                        if end - start <= 1:
+                            raise
+                        self._emit_status(
+                            f"Export {label} lỗi batch — fallback từng câu..."
+                        )
+                        # Build combined file from per-sentence synth
+                        parts: List[bytes] = []
+                        for idx in range(start, end):
+                            if self._stop_flag:
+                                return
+                            piece = self.sentences[idx].text.strip()
+                            if not piece:
+                                continue
+                            sent_label = f"câu {idx + 1}"
+                            try:
+                                data = await self._synthesize_to_bytes_with_retry(
+                                    piece, sent_label
+                                )
+                                parts.append(data)
+                            except Exception as e:
+                                failures.append(f"{sent_label}: {e}")
+                                self._emit_error(f"Bỏ qua {sent_label}: {e}")
+                        if not parts:
+                            raise RuntimeError(f"{label}: không tạo được audio")
+                        combined = b"".join(parts)
+                        tmp_path = out_path + ".part"
+                        try:
+                            with open(tmp_path, "wb") as f:
+                                f.write(combined)
+                            os.replace(tmp_path, out_path)
+                        finally:
+                            self._safe_unlink(tmp_path)
                     results[start] = out_path
                 except Exception as e:
                     self._safe_unlink(out_path)
-                    if self.on_error:
-                        self.on_error(f"Lỗi chuyển {label}: {e}")
-
+                    failures.append(f"{label}: {e}")
+                    self._emit_error(f"Lỗi chuyển {label}: {e}")
 
         tasks = []
         for start in batch_starts:
@@ -627,8 +744,7 @@ class TTSPipeline:
                 paths.append(results[start])
 
         if not paths:
-            if self.on_error:
-                self.on_error("Không có đoạn audio nào được tạo.")
+            self._emit_error("Không có đoạn audio nào được tạo.")
             return
 
         export_path = self.export_path or str(
@@ -642,12 +758,18 @@ class TTSPipeline:
             try:
                 self._merge_mp3_binary(paths, export_path)
             except Exception as e2:
-                if self.on_error:
-                    self.on_error(f"Ghép MP3 thất bại: {e} / {e2}")
+                self._emit_error(f"Ghép MP3 thất bại: {e} / {e2}")
                 return
         finally:
             for p in paths:
                 self._safe_unlink(p)
+
+        if failures:
+            self._emit_status(
+                f"Xuất xong nhưng thiếu {len(failures)} đoạn do lỗi: "
+                + "; ".join(failures[:3])
+                + ("..." if len(failures) > 3 else "")
+            )
 
         if self.on_export_done:
             try:
@@ -689,5 +811,3 @@ class TTSPipeline:
                         pass
         except OSError:
             pass
-
-

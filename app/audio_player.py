@@ -1,12 +1,12 @@
 """Audio playback with pause/resume/stop.
 
-Primary backend on Windows: built-in winmm MCI (no extra packages).
-Uses blocking "play ... wait" so completion is accurate (no false early end).
-Optional fallback: pygame if installed (non-Windows).
+Primary backend: pygame-ce (import as pygame) — plays MP3 from RAM via BytesIO.
+Optional fallback: Windows MCI for file paths only (no pure in-memory play).
 """
 
 from __future__ import annotations
 
+import io
 import os
 import sys
 import threading
@@ -14,8 +14,9 @@ import time
 from typing import Callable, Optional
 
 
+
 class AudioPlayer:
-    """Play / pause / resume / stop audio files."""
+    """Play / pause / resume / stop audio from path or in-memory bytes."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -30,18 +31,103 @@ class AudioPlayer:
         # Generation id: incremented on each stop/new play to ignore stale threads
         self._generation = 0
         self._user_stopped = False
+        # Keep BytesIO alive while pygame.music holds the stream
+        self._source_buf: Optional[io.BytesIO] = None
 
     def _detect_backend(self) -> str:
-        if sys.platform == "win32":
-            return "mci"
         try:
             import pygame  # noqa: F401
 
             return "pygame"
         except ImportError:
-            return "mci" if sys.platform == "win32" else "none"
+            if sys.platform == "win32":
+                return "mci"
+            return "none"
+
+    def _ensure_pygame(self) -> None:
+        import pygame
+
+        if not self._pygame_ready:
+            # edge-tts MP3 is typically 24 kHz mono; pygame resamples as needed
+            pygame.mixer.init(frequency=24000, size=-16, channels=1, buffer=2048)
+            self._pygame_ready = True
 
     # ── public API ────────────────────────────────────────────────
+
+    def play_bytes(
+        self,
+        data: bytes,
+        on_complete: Optional[Callable[[], None]] = None,
+    ) -> None:
+        """Play MP3 (or other mixer-supported) audio from memory."""
+        if not data:
+            raise OSError("Audio data is empty (0 bytes)")
+
+        if self._backend == "pygame":
+            with self._lock:
+                self._stop_internal_locked(fire_complete=False)
+                self._generation += 1
+                gen = self._generation
+                self._user_stopped = False
+                self._current_path = None
+                self._on_complete = on_complete
+                self._playing = True
+                self._paused = False
+                try:
+                    self._pygame_play_bytes(data)
+                except Exception:
+                    self._playing = False
+                    self._on_complete = None
+                    self._source_buf = None
+                    raise
+                self._play_thread = threading.Thread(
+                    target=self._pygame_watch_thread,
+                    args=(gen,),
+                    daemon=True,
+                )
+                self._play_thread.start()
+            return
+
+        if self._backend == "mci":
+            # MCI cannot play from RAM — write a short-lived temp and play path.
+            import tempfile
+
+            fd, path = tempfile.mkstemp(suffix=".mp3", prefix="tts_play_")
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(data)
+            except Exception:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                raise
+
+            def _done_and_cleanup() -> None:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                if on_complete:
+                    on_complete()
+
+            try:
+                self.play(path, on_complete=_done_and_cleanup)
+            except Exception:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                raise
+            return
+
+        raise RuntimeError(
+            "Không có backend phát audio. Cài pygame-ce: pip install pygame-ce"
+        )
 
     def play(
         self,
@@ -50,15 +136,18 @@ class AudioPlayer:
     ) -> None:
         if not os.path.isfile(path):
             raise FileNotFoundError(path)
-        # Empty / truncated MP3: fail fast so the pipeline is not left waiting forever.
         size = os.path.getsize(path)
         if size <= 0:
             raise OSError(f"Audio file is empty (0 bytes): {path}")
 
+        # Prefer pure RAM path when pygame is available
+        if self._backend == "pygame":
+            with open(path, "rb") as f:
+                data = f.read()
+            self.play_bytes(data, on_complete=on_complete)
+            return
+
         with self._lock:
-
-
-            # Stop previous playback without treating as natural complete
             self._stop_internal_locked(fire_complete=False)
 
             self._generation += 1
@@ -76,19 +165,10 @@ class AudioPlayer:
                     daemon=True,
                 )
                 self._play_thread.start()
-            elif self._backend == "pygame":
-                self._pygame_play(path)
-                self._play_thread = threading.Thread(
-                    target=self._pygame_watch_thread,
-                    args=(gen,),
-                    daemon=True,
-                )
-                self._play_thread.start()
             else:
                 self._playing = False
                 raise RuntimeError(
-                    "Không có backend phát audio. Trên Windows dùng MCI; "
-                    "trên hệ khác hãy cài pygame."
+                    "Không có backend phát audio. Cài pygame-ce: pip install pygame-ce"
                 )
 
     def pause(self) -> None:
@@ -108,10 +188,8 @@ class AudioPlayer:
             if not self._playing or not self._paused:
                 return
             if self._backend == "mci":
-                # After pause, resume continues; if wait thread is blocked on play wait, it stays blocked.
                 err = self._mci(f"resume {self._alias}")
                 if err != 0:
-                    # Some devices need play again without re-open
                     self._mci(f"play {self._alias}")
             elif self._backend == "pygame":
                 import pygame
@@ -130,7 +208,6 @@ class AudioPlayer:
         self._on_complete = None if not fire_complete else self._on_complete
 
         if self._backend == "mci":
-            # stop/close unblocks any "play ... wait"
             self._mci_close()
         elif self._backend == "pygame" and self._pygame_ready:
             try:
@@ -146,6 +223,7 @@ class AudioPlayer:
         self._playing = False
         self._paused = False
         self._current_path = None
+        self._source_buf = None
 
     @property
     def is_playing(self) -> bool:
@@ -170,7 +248,7 @@ class AudioPlayer:
                 pass
             self._pygame_ready = False
 
-    # ── MCI (Windows) ─────────────────────────────────────────────
+    # ── MCI (Windows fallback) ────────────────────────────────────
 
     @staticmethod
     def _mci(command: str) -> int:
@@ -191,7 +269,6 @@ class AudioPlayer:
     def _mci_open(self, path: str) -> None:
         path = os.path.abspath(path).replace("/", "\\")
         self._mci_close()
-        # mpegvideo is the reliable type for MP3 on modern Windows
         err = self._mci(f'open "{path}" type mpegvideo alias {self._alias}')
         if err != 0:
             err = self._mci(f'open "{path}" alias {self._alias}')
@@ -199,9 +276,6 @@ class AudioPlayer:
             raise RuntimeError(f"MCI open failed (code {err}): {path}")
 
     def _mci_play_wait_thread(self, path: str, gen: int) -> None:
-        """
-        Open + blocking play wait. Returns only when audio finishes or device is closed/stopped.
-        """
         cb: Optional[Callable[[], None]] = None
         try:
             with self._lock:
@@ -210,7 +284,6 @@ class AudioPlayer:
                 try:
                     self._mci_open(path)
                 except Exception:
-                    # Failed to open — complete immediately so pipeline can continue
                     if gen == self._generation and self._playing:
                         self._playing = False
                         cb = self._on_complete
@@ -222,15 +295,11 @@ class AudioPlayer:
                             pass
                     return
 
-            # Blocking call — do NOT hold lock
-            # "wait" makes mciSendString return only after playback ends or stop/close.
-            err = self._mci(f"play {self._alias} wait")
+            self._mci(f"play {self._alias} wait")
 
             with self._lock:
-                # Stale generation → this play was superseded (stop / new play)
                 if gen != self._generation:
                     return
-                # Natural finish (or error after start). Notify pipeline only if still current.
                 if self._playing and not self._user_stopped:
                     self._playing = False
                     self._paused = False
@@ -257,22 +326,24 @@ class AudioPlayer:
             except Exception:
                 pass
 
-    # ── pygame fallback ───────────────────────────────────────────
+    # ── pygame-ce ─────────────────────────────────────────────────
 
-    def _pygame_play(self, path: str) -> None:
+    def _pygame_play_bytes(self, data: bytes) -> None:
+        """Caller must hold self._lock (or be sole starter)."""
         import pygame
 
-        if not self._pygame_ready:
-            pygame.mixer.init(frequency=24000, size=-16, channels=1, buffer=2048)
-            self._pygame_ready = True
-        pygame.mixer.music.load(path)
+        self._ensure_pygame()
+        buf = io.BytesIO(data)
+        # Keep reference so the stream is not GC'd while mixer reads it
+        self._source_buf = buf
+        pygame.mixer.music.load(buf)
         pygame.mixer.music.play()
 
     def _pygame_watch_thread(self, gen: int) -> None:
         import pygame
 
-        # Small grace period so get_busy() is true after play()
-        time.sleep(0.15)
+        # Grace period so get_busy() is true after play()
+        time.sleep(0.12)
         while True:
             with self._lock:
                 if gen != self._generation or not self._playing:
@@ -282,7 +353,6 @@ class AudioPlayer:
                     continue
                 busy = bool(pygame.mixer.music.get_busy())
             if not busy:
-                # Confirm still stopped (avoid transient false negatives)
                 time.sleep(0.08)
                 with self._lock:
                     if gen != self._generation or not self._playing:
@@ -295,6 +365,13 @@ class AudioPlayer:
                     self._on_complete = None
                     self._playing = False
                     self._paused = False
+                    self._source_buf = None
+                    try:
+                        unload = getattr(pygame.mixer.music, "unload", None)
+                        if callable(unload):
+                            unload()
+                    except Exception:
+                        pass
                 if cb:
                     try:
                         cb()

@@ -448,9 +448,13 @@ class TTSApp(ctk.CTk):
         self.pipeline.on_sentence_start = lambda start, end: self.after(
             0, lambda start=start, end=end: self._ui_sentence_start(start, end)
         )
-        self.pipeline.on_sentence_ready = lambda start, end, p: self.after(
-            0, lambda start=start, end=end, p=p: self._ui_sentence_ready(start, end, p)
+        self.pipeline.on_sentence_ready = lambda start, end, data: self.after(
+            0,
+            lambda start=start, end=end, data=data: self._ui_sentence_ready(
+                start, end, data
+            ),
         )
+
         self.pipeline.on_progress = lambda cur, tot: self.after(
             0, lambda cur=cur, tot=tot: self._progress_var.set(f"{cur}/{tot}")
         )
@@ -460,6 +464,9 @@ class TTSApp(ctk.CTk):
         self.pipeline.on_done = lambda: self.after(0, self._ui_done)
         self.pipeline.on_error = lambda msg: self.after(
             0, lambda msg=msg: self._ui_error(msg)
+        )
+        self.pipeline.on_status = lambda msg: self.after(
+            0, lambda msg=msg: self._ui_status(msg)
         )
         self.pipeline.on_state_change = lambda st: self.after(
             0, lambda st=st: self._ui_state(st)
@@ -478,8 +485,8 @@ class TTSApp(ctk.CTk):
             preview = self._sentences[start].preview
         self._status_var.set(f"Đang xử lý {label}: {preview}")
 
-    def _ui_sentence_ready(self, start: int, end: int, path: str) -> None:
-        """Play synthesized audio for live mode (path already prefetched when possible)."""
+    def _ui_sentence_ready(self, start: int, end: int, data: bytes) -> None:
+        """Play synthesized audio from RAM (pygame-ce BytesIO)."""
         if self.pipeline.state == PipelineState.STOPPING or self.pipeline._stop_flag:
             self.pipeline.notify_playback_finished()
             return
@@ -490,18 +497,17 @@ class TTSApp(ctk.CTk):
         if self._sentences and 0 <= start < len(self._sentences):
             preview = self._sentences[start].preview
         self._status_var.set(f"Đang đọc {label}: {preview}")
-        self._current_audio_path = path
+        self._current_audio_path = None
 
         def on_complete():
-            # Notify first so pipeline can advance; it deletes the file after a short delay.
             self.pipeline.notify_playback_finished()
 
         try:
-            # Play synth file directly (no copy) — lower gap between batches.
-            self.player.play(path, on_complete=on_complete)
+            self.player.play_bytes(data, on_complete=on_complete)
         except Exception as e:
             self._status_var.set(f"Lỗi phát audio: {e}")
             on_complete()
+
 
 
 
@@ -513,15 +519,27 @@ class TTSApp(ctk.CTk):
 
     def _ui_done(self) -> None:
         self._clear_highlight()
+        current = self._status_var.get()
+        # Keep pipeline notes about retries/skips/partial export if already set
+        keep_note = (
+            "bỏ qua" in current.lower()
+            or "thiếu" in current.lower()
+            or current.startswith("Đã xuất")
+            or current.startswith("Xuất xong")
+            or current.startswith("Hoàn tất với")
+        )
         if self._mode_var.get() == "live":
-            self._status_var.set("Hoàn tất đọc.")
+            if not keep_note:
+                self._status_var.set("Hoàn tất đọc.")
             self._save_history("live")
         else:
-            if self._status_var.get().startswith("Đã xuất"):
-                pass
-            else:
+            if not keep_note:
                 self._status_var.set("Hoàn tất.")
         self._set_controls_idle()
+
+    def _ui_status(self, msg: str) -> None:
+        """Non-fatal pipeline status (retry, fallback, partial skip, etc.)."""
+        self._status_var.set(msg)
 
     def _ui_error(self, msg: str) -> None:
         self._status_var.set(f"Lỗi: {msg}")

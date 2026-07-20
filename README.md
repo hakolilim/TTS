@@ -20,8 +20,9 @@
 
 - Python 3.10+ (đã kiểm tra hướng hỗ trợ Python 3.14)
 - Kết nối Internet (edge-tts gọi dịch vụ Microsoft)
-- **Windows**: phát audio dùng **MCI** có sẵn (không cần pygame)
+- **pygame-ce**: phát audio LIVE trực tiếp từ RAM (`BytesIO`), không ghi file temp khi đọc
 - (Khuyến nghị) **ffmpeg** trong PATH để ghép MP3 chất lượng tốt qua `pydub`. Nếu không có ffmpeg, app vẫn thử ghép binary MP3.
+
 
 ### Cài ffmpeg (Windows)
 
@@ -38,7 +39,8 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-> **Lưu ý Python 3.13/3.14:** package `audioop-lts` được cài tự động để `pydub` hoạt động. `pygame` không bắt buộc trên Windows.
+> **Lưu ý Python 3.13/3.14:** package `audioop-lts` được cài tự động để `pydub` hoạt động. Cần `pygame-ce` để đọc trực tiếp từ RAM.
+
 
 
 ## Chạy
@@ -94,7 +96,9 @@ TTS/
 ## Lưu ý
 
 - App gửi **tối đa 3 câu / request** tới edge-tts (batch) để giảm số round-trip; highlight live theo cả batch đang phát.
-- File tạm nằm trong `output/temp` và được dọn khi thoát.
+- **Đọc trực tiếp**: audio giữ trong RAM, phát bằng pygame-ce (`BytesIO`) — không ghi file temp khi đọc.
+- **Xuất MP3**: file tạm batch nằm trong `output/temp` và được dọn khi thoát / sau khi ghép.
 - Lịch sử tối đa 100 mục (`history.json`).
+
 
 
