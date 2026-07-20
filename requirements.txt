@@ -1,0 +1,7 @@
+edge-tts>=6.1.12
+customtkinter>=5.2.0
+pydub>=0.25.1
+# audioop was removed in Python 3.13+; pydub still needs it for some ops
+audioop-lts; python_version>="3.13"
+# pygame optional (not required on Windows — app uses built-in MCI player)
+# pygame>=2.5.0
