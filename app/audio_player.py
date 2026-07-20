@@ -1,7 +1,8 @@
 """Audio playback with pause/resume/stop.
 
 Primary backend on Windows: built-in winmm MCI (no extra packages).
-Optional fallback: pygame if installed.
+Uses blocking "play ... wait" so completion is accurate (no false early end).
+Optional fallback: pygame if installed (non-Windows).
 """
 
 from __future__ import annotations
@@ -21,12 +22,14 @@ class AudioPlayer:
         self._playing = False
         self._paused = False
         self._current_path: Optional[str] = None
-        self._watch_thread: Optional[threading.Thread] = None
-        self._stop_watch = threading.Event()
+        self._play_thread: Optional[threading.Thread] = None
         self._on_complete: Optional[Callable[[], None]] = None
         self._backend = self._detect_backend()
         self._alias = "edge_tts_alias"
         self._pygame_ready = False
+        # Generation id: incremented on each stop/new play to ignore stale threads
+        self._generation = 0
+        self._user_stopped = False
 
     def _detect_backend(self) -> str:
         if sys.platform == "win32":
@@ -49,28 +52,38 @@ class AudioPlayer:
             raise FileNotFoundError(path)
 
         with self._lock:
-            self._stop_internal_locked()
+            # Stop previous playback without treating as natural complete
+            self._stop_internal_locked(fire_complete=False)
+
+            self._generation += 1
+            gen = self._generation
+            self._user_stopped = False
             self._current_path = path
             self._on_complete = on_complete
             self._playing = True
             self._paused = False
-            self._stop_watch.clear()
 
             if self._backend == "mci":
-                self._mci_open_and_play(path)
+                self._play_thread = threading.Thread(
+                    target=self._mci_play_wait_thread,
+                    args=(path, gen),
+                    daemon=True,
+                )
+                self._play_thread.start()
             elif self._backend == "pygame":
                 self._pygame_play(path)
+                self._play_thread = threading.Thread(
+                    target=self._pygame_watch_thread,
+                    args=(gen,),
+                    daemon=True,
+                )
+                self._play_thread.start()
             else:
                 self._playing = False
                 raise RuntimeError(
                     "Không có backend phát audio. Trên Windows dùng MCI; "
                     "trên hệ khác hãy cài pygame."
                 )
-
-            self._watch_thread = threading.Thread(
-                target=self._watch_end, daemon=True
-            )
-            self._watch_thread.start()
 
     def pause(self) -> None:
         with self._lock:
@@ -89,7 +102,11 @@ class AudioPlayer:
             if not self._playing or not self._paused:
                 return
             if self._backend == "mci":
-                self._mci(f"resume {self._alias}")
+                # After pause, resume continues; if wait thread is blocked on play wait, it stays blocked.
+                err = self._mci(f"resume {self._alias}")
+                if err != 0:
+                    # Some devices need play again without re-open
+                    self._mci(f"play {self._alias}")
             elif self._backend == "pygame":
                 import pygame
 
@@ -98,12 +115,16 @@ class AudioPlayer:
 
     def stop(self) -> None:
         with self._lock:
-            self._stop_internal_locked()
+            self._stop_internal_locked(fire_complete=False)
 
-    def _stop_internal_locked(self) -> None:
-        self._stop_watch.set()
-        self._on_complete = None
+    def _stop_internal_locked(self, fire_complete: bool = False) -> None:
+        """Caller must hold self._lock."""
+        self._user_stopped = not fire_complete
+        self._generation += 1  # invalidate in-flight play threads
+        self._on_complete = None if not fire_complete else self._on_complete
+
         if self._backend == "mci":
+            # stop/close unblocks any "play ... wait"
             self._mci_close()
         elif self._backend == "pygame" and self._pygame_ready:
             try:
@@ -115,6 +136,7 @@ class AudioPlayer:
                     unload()
             except Exception:
                 pass
+
         self._playing = False
         self._paused = False
         self._current_path = None
@@ -148,7 +170,7 @@ class AudioPlayer:
     def _mci(command: str) -> int:
         import ctypes
 
-        return ctypes.windll.winmm.mciSendStringW(command, None, 0, None)
+        return int(ctypes.windll.winmm.mciSendStringW(command, None, 0, None))
 
     def _mci_close(self) -> None:
         try:
@@ -160,43 +182,74 @@ class AudioPlayer:
         except Exception:
             pass
 
-    def _mci_open_and_play(self, path: str) -> None:
-        # Normalize path for MCI
+    def _mci_open(self, path: str) -> None:
         path = os.path.abspath(path).replace("/", "\\")
         self._mci_close()
-        # Prefer mpegvideo for mp3; fallback to mpegvideo automatically
+        # mpegvideo is the reliable type for MP3 on modern Windows
         err = self._mci(f'open "{path}" type mpegvideo alias {self._alias}')
         if err != 0:
             err = self._mci(f'open "{path}" alias {self._alias}')
         if err != 0:
             raise RuntimeError(f"MCI open failed (code {err}): {path}")
-        err = self._mci(f"play {self._alias}")
-        if err != 0:
-            self._mci_close()
-            raise RuntimeError(f"MCI play failed (code {err})")
 
-    def _mci_is_playing(self) -> bool:
-        import ctypes
-
-        buf = ctypes.create_unicode_buffer(128)
-        ctypes.windll.winmm.mciSendStringW(
-            f"status {self._alias} mode", buf, 128, None
-        )
-        mode = (buf.value or "").strip().lower()
-        # modes: not ready, stopped, playing, paused, seeking
-        return mode == "playing"
-
-    def _mci_mode(self) -> str:
-        import ctypes
-
-        buf = ctypes.create_unicode_buffer(128)
+    def _mci_play_wait_thread(self, path: str, gen: int) -> None:
+        """
+        Open + blocking play wait. Returns only when audio finishes or device is closed/stopped.
+        """
+        cb: Optional[Callable[[], None]] = None
         try:
-            ctypes.windll.winmm.mciSendStringW(
-                f"status {self._alias} mode", buf, 128, None
-            )
-            return (buf.value or "").strip().lower()
+            with self._lock:
+                if gen != self._generation:
+                    return
+                try:
+                    self._mci_open(path)
+                except Exception:
+                    # Failed to open — complete immediately so pipeline can continue
+                    if gen == self._generation and self._playing:
+                        self._playing = False
+                        cb = self._on_complete
+                        self._on_complete = None
+                    if cb:
+                        try:
+                            cb()
+                        except Exception:
+                            pass
+                    return
+
+            # Blocking call — do NOT hold lock
+            # "wait" makes mciSendString return only after playback ends or stop/close.
+            err = self._mci(f"play {self._alias} wait")
+
+            with self._lock:
+                # Stale generation → this play was superseded (stop / new play)
+                if gen != self._generation:
+                    return
+                # Natural finish (or error after start). Notify pipeline only if still current.
+                if self._playing and not self._user_stopped:
+                    self._playing = False
+                    self._paused = False
+                    cb = self._on_complete
+                    self._on_complete = None
+                try:
+                    self._mci_close()
+                except Exception:
+                    pass
         except Exception:
-            return ""
+            with self._lock:
+                if gen == self._generation and self._playing:
+                    self._playing = False
+                    cb = self._on_complete
+                    self._on_complete = None
+                try:
+                    self._mci_close()
+                except Exception:
+                    pass
+
+        if cb:
+            try:
+                cb()
+            except Exception:
+                pass
 
     # ── pygame fallback ───────────────────────────────────────────
 
@@ -209,34 +262,33 @@ class AudioPlayer:
         pygame.mixer.music.load(path)
         pygame.mixer.music.play()
 
-    # ── completion watcher ────────────────────────────────────────
+    def _pygame_watch_thread(self, gen: int) -> None:
+        import pygame
 
-    def _watch_end(self) -> None:
-        while not self._stop_watch.is_set():
+        # Small grace period so get_busy() is true after play()
+        time.sleep(0.15)
+        while True:
             with self._lock:
-                if not self._playing:
+                if gen != self._generation or not self._playing:
                     return
                 if self._paused:
                     time.sleep(0.05)
                     continue
-                still = False
-                if self._backend == "mci":
-                    mode = self._mci_mode()
-                    # treat empty/stopped/not ready as finished
-                    still = mode in ("playing", "seeking")
-                elif self._backend == "pygame":
-                    import pygame
-
-                    still = bool(pygame.mixer.music.get_busy())
-            if not still:
-                cb = None
+                busy = bool(pygame.mixer.music.get_busy())
+            if not busy:
+                # Confirm still stopped (avoid transient false negatives)
+                time.sleep(0.08)
                 with self._lock:
-                    if self._playing and not self._paused:
-                        self._playing = False
-                        cb = self._on_complete
-                        self._on_complete = None
-                        if self._backend == "mci":
-                            self._mci_close()
+                    if gen != self._generation or not self._playing:
+                        return
+                    if self._paused:
+                        continue
+                    if pygame.mixer.music.get_busy():
+                        continue
+                    cb = self._on_complete
+                    self._on_complete = None
+                    self._playing = False
+                    self._paused = False
                 if cb:
                     try:
                         cb()
