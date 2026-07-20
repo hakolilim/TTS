@@ -433,43 +433,26 @@ class TTSApp(ctk.CTk):
         self._status_var.set(f"Đang xử lý câu {index + 1}: {sentence.preview}")
 
     def _ui_sentence_ready(self, index: int, sentence: Sentence, path: str) -> None:
-        """Play synthesized audio for live mode."""
+        """Play synthesized audio for live mode (path already prefetched when possible)."""
         if self.pipeline.state == PipelineState.STOPPING or self.pipeline._stop_flag:
             self.pipeline.notify_playback_finished()
             return
 
         self._highlight_sentence(sentence)
         self._status_var.set(f"Đang đọc câu {index + 1}: {sentence.preview}")
+        self._current_audio_path = path
 
-        # Copy file so pipeline can delete its temp without Windows file locks.
-        play_path = path
-        try:
-            import shutil
-            import uuid as _uuid
-
-            play_dir = OUTPUT_DIR / "temp"
-            play_dir.mkdir(parents=True, exist_ok=True)
-            play_path = str(play_dir / f"play_{_uuid.uuid4().hex}.mp3")
-            shutil.copy2(path, play_path)
-        except Exception:
-            play_path = path
-
-
-        self._current_audio_path = play_path
-
-        def on_complete(p=play_path):
+        def on_complete():
+            # Notify first so pipeline can advance; it deletes the file after a short delay.
             self.pipeline.notify_playback_finished()
-            try:
-                if p and os.path.isfile(p) and p != path:
-                    os.remove(p)
-            except OSError:
-                pass
 
         try:
-            self.player.play(play_path, on_complete=on_complete)
+            # Play synth file directly (no copy) — lower gap between sentences.
+            self.player.play(path, on_complete=on_complete)
         except Exception as e:
             self._status_var.set(f"Lỗi phát audio: {e}")
             on_complete()
+
 
 
     def _ui_export_done(self, path: str) -> None:
