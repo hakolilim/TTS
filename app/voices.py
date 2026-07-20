@@ -7,7 +7,10 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-CACHE_PATH = Path(__file__).resolve().parent.parent / "voices_cache.json"
+from app.paths import app_path
+
+CACHE_PATH = app_path("voices_cache.json")
+
 
 
 async def _fetch_voices() -> List[Dict[str, Any]]:

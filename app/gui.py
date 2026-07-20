@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import threading
 import tkinter as tk
 from datetime import datetime
@@ -14,6 +15,7 @@ import customtkinter as ctk
 
 from app.audio_player import AudioPlayer
 from app.history import HistoryEntry, HistoryStore
+from app.paths import app_path, resource_path
 from app.sentence_splitter import Sentence, sentence_index_at_offset, split_sentences
 from app.tts_engine import PipelineMode, PipelineState, TTSPipeline
 from app.voices import (
@@ -28,8 +30,10 @@ from app.voices import (
 ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("blue")
 
-APP_TITLE = "Edge TTS — Chuyển văn bản thành giọng nói"
-OUTPUT_DIR = Path(__file__).resolve().parent.parent / "output"
+APP_TITLE = "TTS"
+OUTPUT_DIR = app_path("output")
+ICON_PATH = resource_path("app.ico")
+
 
 # Text widget highlight colors
 HIGHLIGHT_BG = "#f59e0b"
@@ -147,8 +151,10 @@ class TTSApp(ctk.CTk):
         self.title(APP_TITLE)
         self.geometry("980x720")
         self.minsize(800, 560)
+        self._set_app_icon()
 
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
 
         self.player = AudioPlayer()
         self.pipeline = TTSPipeline(temp_dir=OUTPUT_DIR / "temp")
@@ -170,7 +176,38 @@ class TTSApp(ctk.CTk):
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+    def _set_app_icon(self) -> None:
+        """Window / taskbar icon from app.ico (dev + frozen)."""
+        icon = ICON_PATH
+        if not icon.is_file():
+            # Fallback: next to executable
+            icon = app_path("app.ico")
+        if not icon.is_file():
+            return
+        try:
+            self.iconbitmap(default=str(icon))
+        except Exception:
+            try:
+                self.iconbitmap(str(icon))
+            except Exception:
+                pass
+        # Windows taskbar icon for customtkinter / tk
+        try:
+            self.wm_iconbitmap(str(icon))
+        except Exception:
+            pass
+        # Optional iconphoto for better multi-size support
+        try:
+            from PIL import Image, ImageTk
+
+            img = Image.open(icon)
+            self._icon_photo = ImageTk.PhotoImage(img)
+            self.iconphoto(True, self._icon_photo)
+        except Exception:
+            pass
+
     # ── UI construction ──────────────────────────────────────────
+
 
     def _build_ui(self) -> None:
         self.grid_columnconfigure(0, weight=1)

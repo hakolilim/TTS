@@ -46,6 +46,22 @@ pip install -r requirements.txt
 python main.py
 ```
 
+## Đóng gói EXE (Windows)
+
+```bash
+build_exe.bat
+```
+
+Hoặc:
+
+```bash
+python -m PyInstaller --noconfirm --clean --onefile --windowed --name TTS --icon app.ico --add-data "app.ico;." --collect-all customtkinter --collect-all edge_tts main.py
+```
+
+Kết quả: `dist\TTS.exe` (icon `app.ico`, tên cửa sổ **TTS**).  
+File `history.json`, `voices_cache.json`, `output/` được tạo **cạnh file exe**.
+
+
 ## Cách dùng
 
 1. Dán văn bản vào ô soạn thảo.

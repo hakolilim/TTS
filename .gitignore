@@ -50,7 +50,11 @@ _test_*.py
 *.log
 
 # Distribution / packaging
+dist/
+build/
+*.spec
 *.whl
+
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/

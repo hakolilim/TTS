@@ -9,8 +9,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
-HISTORY_PATH = Path(__file__).resolve().parent.parent / "history.json"
+from app.paths import app_path
+
+HISTORY_PATH = app_path("history.json")
 MAX_ENTRIES = 100
+
 
 
 @dataclass
