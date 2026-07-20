@@ -235,9 +235,9 @@ class TTSApp(ctk.CTk):
         self.export_entry.pack(side="left", padx=(16, 4))
         self.browse_btn = ctk.CTkButton(mode_row, text="Chọn file...", width=100, command=self._browse_export)
         self.browse_btn.pack(side="left", padx=4)
-        self._on_mode_change()
 
         # Text area with native Text for tags
+
         text_frame = ctk.CTkFrame(self)
         text_frame.grid(row=2, column=0, sticky="nsew", padx=12, pady=6)
         text_frame.grid_columnconfigure(0, weight=1)
@@ -314,7 +314,11 @@ class TTSApp(ctk.CTk):
         )
         self.status_label.grid(row=0, column=6, sticky="e", padx=(8, 12))
 
+        # Apply mode-dependent widget states after all controls exist
+        self._on_mode_change()
+
     # ── Voices ────────────────────────────────────────────────────
+
 
     def _load_voices_async(self, force: bool = False) -> None:
         self._status_var.set("Đang tải danh sách giọng...")
@@ -380,10 +384,14 @@ class TTSApp(ctk.CTk):
     def _on_mode_change(self) -> None:
         export = self._mode_var.get() == "export"
         state = "normal" if export else "disabled"
-        self.export_entry.configure(state=state)
-        self.browse_btn.configure(state=state)
+        if hasattr(self, "export_entry"):
+            self.export_entry.configure(state=state)
+        if hasattr(self, "browse_btn"):
+            self.browse_btn.configure(state=state)
         # Seek only useful in live
-        self.seek_btn.configure(state="normal" if not export else "disabled")
+        if hasattr(self, "seek_btn"):
+            self.seek_btn.configure(state="normal" if not export else "disabled")
+
 
     def _browse_export(self) -> None:
         path = filedialog.asksaveasfilename(
