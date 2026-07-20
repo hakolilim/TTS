@@ -6,6 +6,7 @@ import asyncio
 import os
 import tempfile
 import threading
+import time
 import uuid
 from enum import Enum
 from pathlib import Path
@@ -13,6 +14,11 @@ from typing import Callable, Dict, List, Optional, Set
 
 
 from app.sentence_splitter import Sentence
+
+# Reject empty / truncated edge-tts responses (common cause of stuck live playback).
+MIN_AUDIO_BYTES = 5
+MAX_SYNTH_RETRIES = 3
+RETRY_BASE_DELAY_S = 0.35
 
 
 class PipelineMode(str, Enum):
@@ -33,6 +39,7 @@ class TTSPipeline:
 
     LIVE mode prefetches upcoming *batches* (default 3 sentences per edge-tts
     request) while the current batch is playing, so transitions are nearly seamless.
+    Live audio is held in RAM; only a single play-temp file is written for MCI.
     """
 
     def __init__(
@@ -45,6 +52,9 @@ class TTSPipeline:
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         self.prefetch_ahead = max(1, prefetch_ahead)
         self.sentences_per_request = max(1, sentences_per_request)
+        # Single on-disk slot for the batch currently being played (MCI needs a path).
+        self._play_path = str(self.temp_dir / "play_current.mp3")
+
 
         self._state = PipelineState.IDLE
         self._lock = threading.Lock()
@@ -176,17 +186,96 @@ class TTSPipeline:
                 except Exception:
                     pass
 
-    async def _synthesize_to_file(self, text: str, out_path: str) -> None:
+    async def _synthesize_to_bytes(self, text: str) -> bytes:
+        """Stream edge-tts audio into memory (no disk I/O)."""
         import edge_tts
 
         communicate = edge_tts.Communicate(
             text, self.voice, rate=self.rate, pitch=self.pitch
         )
-        await communicate.save(out_path)
+        buf = bytearray()
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                buf.extend(chunk["data"])
+        return bytes(buf)
+
+    async def _synthesize_to_bytes_with_retry(self, text: str, label: str) -> bytes:
+        """Synthesize with retries when response is empty/too small or network fails."""
+        last_err: Optional[BaseException] = None
+        for attempt in range(1, MAX_SYNTH_RETRIES + 1):
+            if self._stop_flag:
+                raise asyncio.CancelledError()
+            try:
+                data = await self._synthesize_to_bytes(text)
+                if len(data) < MIN_AUDIO_BYTES:
+                    raise RuntimeError(
+                        f"audio rỗng/quá nhỏ ({len(data)} bytes, min {MIN_AUDIO_BYTES})"
+                    )
+                return data
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                last_err = e
+                if attempt < MAX_SYNTH_RETRIES and not self._stop_flag:
+                    await asyncio.sleep(RETRY_BASE_DELAY_S * attempt)
+        raise RuntimeError(
+            f"{label}: thất bại sau {MAX_SYNTH_RETRIES} lần thử — {last_err}"
+        )
+
+    async def _synthesize_to_file(
+        self, text: str, out_path: str, label: str = "export"
+    ) -> None:
+        """Write MP3 to disk (export path). Retries empty / failed synth."""
+        data = await self._synthesize_to_bytes_with_retry(text, label)
+        # Atomic-ish write: temp then replace to avoid leaving 0-byte targets mid-fail
+        tmp_path = out_path + ".part"
+        try:
+            with open(tmp_path, "wb") as f:
+                f.write(data)
+            os.replace(tmp_path, out_path)
+        finally:
+            self._safe_unlink(tmp_path)
+        if not os.path.isfile(out_path) or os.path.getsize(out_path) < MIN_AUDIO_BYTES:
+            self._safe_unlink(out_path)
+            raise RuntimeError(f"Ghi file thất bại hoặc file rỗng: {out_path}")
+
 
     def _temp_file(self, suffix: str = ".mp3") -> str:
         name = f"tts_{uuid.uuid4().hex}{suffix}"
         return str(self.temp_dir / name)
+
+    def _materialize_play_file(self, data: bytes) -> str:
+        """Write RAM audio to the single play-temp path for MCI/pygame.
+
+        Retries briefly if Windows still holds a lock on the previous play file.
+        """
+        path = self._play_path
+        tmp_path = path + ".part"
+        last_err: Optional[BaseException] = None
+        for attempt in range(5):
+            try:
+                with open(tmp_path, "wb") as f:
+                    f.write(data)
+                # Prefer replace; if locked, try unlink + rename
+                try:
+                    os.replace(tmp_path, path)
+                except OSError:
+                    self._safe_unlink(path)
+                    os.replace(tmp_path, path)
+                if os.path.isfile(path) and os.path.getsize(path) >= MIN_AUDIO_BYTES:
+                    return path
+                last_err = RuntimeError("file phát tạm rỗng sau khi ghi")
+                time.sleep(0.05 * (attempt + 1))
+            except OSError as e:
+                last_err = e
+                # Tiny blocking wait: Windows may still hold MCI lock on previous play file.
+                time.sleep(0.05 * (attempt + 1))
+            finally:
+                self._safe_unlink(tmp_path)
+
+        self._safe_unlink(path)
+        raise RuntimeError(f"Không tạo được file phát tạm: {last_err}")
+
 
     # ── Batch helpers ─────────────────────────────────────────────
 
@@ -205,54 +294,62 @@ class TTSPipeline:
             return f"câu {start + 1}"
         return f"câu {start + 1}–{end}"
 
-    # ── Prefetch buffer helpers ───────────────────────────────────
+    # ── Prefetch buffer helpers (LIVE: cache holds MP3 bytes in RAM) ──
 
     def _clear_cache(
         self,
-        cache: Dict[int, str],
+        cache: Dict[int, bytes],
         keep: Optional[Set[int]] = None,
     ) -> None:
         keep = keep or set()
         for idx in list(cache.keys()):
             if idx not in keep:
-                self._safe_unlink(cache.pop(idx, None) or "")
+                cache.pop(idx, None)
 
     async def _ensure_cached(
         self,
         start: int,
         end: int,
-        cache: Dict[int, str],
+        cache: Dict[int, bytes],
         inflight: Dict[int, asyncio.Task],
-    ) -> Optional[str]:
-        """Return audio path for batch [start, end), synthesizing if needed."""
+    ) -> Optional[bytes]:
+        """Return MP3 bytes for batch [start, end), synthesizing if needed."""
         if start in cache:
-            return cache[start]
+            data = cache[start]
+            if len(data) >= MIN_AUDIO_BYTES:
+                return data
+            cache.pop(start, None)
 
-        if start in inflight:
+        existing = inflight.get(start)
+        if existing is not None:
             try:
-                path = await inflight[start]
-                return path
+                data = await existing
+                if data and len(data) >= MIN_AUDIO_BYTES:
+                    return data
             except Exception:
-                return None
+                pass
+            # Prefetch failed or returned bad audio — clear only if still same task.
+            if inflight.get(start) is existing:
+                inflight.pop(start, None)
+            # Fall through and re-synth.
 
         text = self._batch_text(start, end)
         if not text:
             return None
-        out_path = self._temp_file()
         label = self._batch_label(start, end)
 
-        async def _job() -> str:
-            await self._synthesize_to_file(text, out_path)
-            cache[start] = out_path
-            return out_path
+        async def _job() -> bytes:
+            data = await self._synthesize_to_bytes_with_retry(text, label)
+            cache[start] = data
+            return data
 
         task = asyncio.create_task(_job())
         inflight[start] = task
         try:
-            path = await task
-            return path
+            data = await task
+            return data
         except Exception as e:
-            self._safe_unlink(out_path)
+            cache.pop(start, None)
             if self.on_error:
                 try:
                     self.on_error(f"Lỗi chuyển {label}: {e}")
@@ -260,16 +357,18 @@ class TTSPipeline:
                     pass
             return None
         finally:
-            inflight.pop(start, None)
+            if inflight.get(start) is task:
+                inflight.pop(start, None)
+
 
     def _schedule_prefetch(
         self,
         from_index: int,
         total: int,
-        cache: Dict[int, str],
+        cache: Dict[int, bytes],
         inflight: Dict[int, asyncio.Task],
     ) -> None:
-        """Kick off background synth for the next N batches (non-blocking)."""
+        """Kick off background synth for the next N batches (non-blocking, RAM cache)."""
         batch_size = self.sentences_per_request
         for b in range(self.prefetch_ahead):
             start = from_index + b * batch_size
@@ -281,17 +380,16 @@ class TTSPipeline:
             text = self._batch_text(start, end)
             if not text:
                 continue
-            out_path = self._temp_file()
             label = self._batch_label(start, end)
 
             async def _job(
                 idx: int = start,
-                path: str = out_path,
                 payload: str = text,
-            ) -> str:
-                await self._synthesize_to_file(payload, path)
-                cache[idx] = path
-                return path
+                lbl: str = label,
+            ) -> bytes:
+                data = await self._synthesize_to_bytes_with_retry(payload, lbl)
+                cache[idx] = data
+                return data
 
             task = asyncio.create_task(_job())
             inflight[start] = task
@@ -299,14 +397,16 @@ class TTSPipeline:
             def _done(
                 t: asyncio.Task,
                 idx: int = start,
-                path: str = out_path,
                 lbl: str = label,
             ) -> None:
-                inflight.pop(idx, None)
+                # Only drop if this callback still owns the slot (avoid racing re-synth).
+                if inflight.get(idx) is t:
+                    inflight.pop(idx, None)
                 try:
                     t.result()
+                except asyncio.CancelledError:
+                    cache.pop(idx, None)
                 except Exception as e:
-                    self._safe_unlink(path)
                     cache.pop(idx, None)
                     if self.on_error:
                         try:
@@ -315,6 +415,7 @@ class TTSPipeline:
                             pass
 
             task.add_done_callback(_done)
+
 
     async def _cancel_inflight(self, inflight: Dict[int, asyncio.Task]) -> None:
         tasks = list(inflight.values())
@@ -327,12 +428,13 @@ class TTSPipeline:
     async def _live_loop(self) -> None:
         """
         Producer-consumer live loop:
-        - Prefetch next batches while current one plays
+        - Prefetch next batches into RAM while current one plays
         - Each batch (default 3 sentences) = one edge-tts request
+        - Only materialize one play-temp file for the player (MCI needs a path)
         """
         total = len(self.sentences)
         i = self.current_index
-        cache: Dict[int, str] = {}
+        cache: Dict[int, bytes] = {}
         inflight: Dict[int, asyncio.Task] = {}
         batch_size = self.sentences_per_request
 
@@ -379,9 +481,9 @@ class TTSPipeline:
                     except Exception:
                         pass
 
-                # Ensure this batch audio is ready (await if still synthesizing)
-                out_path = await self._ensure_cached(i, end, cache, inflight)
-                if not out_path:
+                # Ensure this batch audio is ready in RAM
+                data = await self._ensure_cached(i, end, cache, inflight)
+                if not data:
                     i = end
                     self._schedule_prefetch(i, total, cache, inflight)
                     continue
@@ -394,11 +496,25 @@ class TTSPipeline:
                 # Prefetch further batches while we play this one
                 self._schedule_prefetch(i + batch_size, total, cache, inflight)
 
+                # Materialize single play file from RAM for MCI
+                try:
+                    play_path = self._materialize_play_file(data)
+                except Exception as e:
+                    if self.on_error:
+                        try:
+                            self.on_error(f"Lỗi ghi file phát: {e}")
+                        except Exception:
+                            pass
+                    cache.pop(i, None)
+                    i = end
+                    self._schedule_prefetch(i, total, cache, inflight)
+                    continue
+
                 # Hand off to player
                 self._playback_done.clear()
                 if self.on_sentence_ready:
                     try:
-                        self.on_sentence_ready(i, end, out_path)
+                        self.on_sentence_ready(i, end, play_path)
                     except Exception as e:
                         if self.on_error:
                             self.on_error(str(e))
@@ -411,12 +527,10 @@ class TTSPipeline:
                     # Keep event loop free so prefetch tasks progress
                     await asyncio.sleep(0.03)
 
-                # Done with this file (player should have closed handle)
-                path = cache.pop(i, None)
-                if path:
-                    # Small delay helps Windows release MCI file locks
-                    await asyncio.sleep(0.02)
-                    self._safe_unlink(path)
+                # Drop consumed batch from RAM cache; release play file after MCI unlock
+                cache.pop(i, None)
+                await asyncio.sleep(0.02)
+                self._safe_unlink(self._play_path)
 
                 if self._stop_flag:
                     break
@@ -436,6 +550,9 @@ class TTSPipeline:
         finally:
             await self._cancel_inflight(inflight)
             self._clear_cache(cache)
+            self._safe_unlink(self._play_path)
+            self._safe_unlink(self._play_path + ".part")
+
 
     async def _export_loop(self) -> None:
         total = len(self.sentences)
@@ -462,12 +579,13 @@ class TTSPipeline:
                 out_path = self._temp_file()
                 label = self._batch_label(start, end)
                 try:
-                    await self._synthesize_to_file(text, out_path)
+                    await self._synthesize_to_file(text, out_path, label=label)
                     results[start] = out_path
                 except Exception as e:
                     self._safe_unlink(out_path)
                     if self.on_error:
                         self.on_error(f"Lỗi chuyển {label}: {e}")
+
 
         tasks = []
         for start in batch_starts:
@@ -563,15 +681,13 @@ class TTSPipeline:
 
     def cleanup_temp(self) -> None:
         try:
-            for f in self.temp_dir.glob("tts_*"):
-                try:
-                    f.unlink()
-                except OSError:
-                    pass
-            for f in self.temp_dir.glob("play_*"):
-                try:
-                    f.unlink()
-                except OSError:
-                    pass
+            for pattern in ("tts_*", "play_*", "*.part"):
+                for f in self.temp_dir.glob(pattern):
+                    try:
+                        f.unlink()
+                    except OSError:
+                        pass
         except OSError:
             pass
+
+

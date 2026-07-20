@@ -50,8 +50,14 @@ class AudioPlayer:
     ) -> None:
         if not os.path.isfile(path):
             raise FileNotFoundError(path)
+        # Empty / truncated MP3: fail fast so the pipeline is not left waiting forever.
+        size = os.path.getsize(path)
+        if size <= 0:
+            raise OSError(f"Audio file is empty (0 bytes): {path}")
 
         with self._lock:
+
+
             # Stop previous playback without treating as natural complete
             self._stop_internal_locked(fire_complete=False)
 
