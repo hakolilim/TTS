@@ -2,8 +2,9 @@
 
 Ứng dụng desktop Python dùng thư viện **edge-tts** để chuyển văn bản thành giọng nói, với hai chế độ:
 
-1. **Đọc trực tiếp** — tách từng câu, gửi request AI (edge-tts) và phát ngay; highlight câu đang đọc; bôi đen để tua.
-2. **Xuất MP3** — cùng pipeline từng câu, ghép thành một file MP3.
+1. **Đọc trực tiếp** — tách câu, gửi **tối đa 3 câu / request** edge-tts, phát ngay; highlight batch đang đọc; bôi đen để tua.
+2. **Xuất MP3** — cùng pipeline theo batch 3 câu, ghép thành một file MP3.
+
 
 ## Tính năng
 
@@ -92,6 +93,8 @@ TTS/
 
 ## Lưu ý
 
-- App gửi **từng câu** một request tới edge-tts (đúng yêu cầu pipeline chung).
+- App gửi **tối đa 3 câu / request** tới edge-tts (batch) để giảm số round-trip; highlight live theo cả batch đang phát.
 - File tạm nằm trong `output/temp` và được dọn khi thoát.
 - Lịch sử tối đa 100 mục (`history.json`).
+
+

@@ -444,11 +444,12 @@ class TTSApp(ctk.CTk):
 
     def _wire_pipeline(self) -> None:
         # Use default-arg lambdas to capture values (avoid late-binding bugs).
-        self.pipeline.on_sentence_start = lambda i, s: self.after(
-            0, lambda i=i, s=s: self._ui_sentence_start(i, s)
+        # Pipeline passes batch range [start, end) (exclusive end).
+        self.pipeline.on_sentence_start = lambda start, end: self.after(
+            0, lambda start=start, end=end: self._ui_sentence_start(start, end)
         )
-        self.pipeline.on_sentence_ready = lambda i, s, p: self.after(
-            0, lambda i=i, s=s, p=p: self._ui_sentence_ready(i, s, p)
+        self.pipeline.on_sentence_ready = lambda start, end, p: self.after(
+            0, lambda start=start, end=end, p=p: self._ui_sentence_ready(start, end, p)
         )
         self.pipeline.on_progress = lambda cur, tot: self.after(
             0, lambda cur=cur, tot=tot: self._progress_var.set(f"{cur}/{tot}")
@@ -464,19 +465,31 @@ class TTSApp(ctk.CTk):
             0, lambda st=st: self._ui_state(st)
         )
 
+    def _batch_status_label(self, start: int, end: int) -> str:
+        if end - start <= 1:
+            return f"câu {start + 1}"
+        return f"câu {start + 1}–{end}"
 
-    def _ui_sentence_start(self, index: int, sentence: Sentence) -> None:
-        self._highlight_sentence(sentence)
-        self._status_var.set(f"Đang xử lý câu {index + 1}: {sentence.preview}")
+    def _ui_sentence_start(self, start: int, end: int) -> None:
+        self._highlight_batch(start, end)
+        label = self._batch_status_label(start, end)
+        preview = ""
+        if self._sentences and 0 <= start < len(self._sentences):
+            preview = self._sentences[start].preview
+        self._status_var.set(f"Đang xử lý {label}: {preview}")
 
-    def _ui_sentence_ready(self, index: int, sentence: Sentence, path: str) -> None:
+    def _ui_sentence_ready(self, start: int, end: int, path: str) -> None:
         """Play synthesized audio for live mode (path already prefetched when possible)."""
         if self.pipeline.state == PipelineState.STOPPING or self.pipeline._stop_flag:
             self.pipeline.notify_playback_finished()
             return
 
-        self._highlight_sentence(sentence)
-        self._status_var.set(f"Đang đọc câu {index + 1}: {sentence.preview}")
+        self._highlight_batch(start, end)
+        label = self._batch_status_label(start, end)
+        preview = ""
+        if self._sentences and 0 <= start < len(self._sentences):
+            preview = self._sentences[start].preview
+        self._status_var.set(f"Đang đọc {label}: {preview}")
         self._current_audio_path = path
 
         def on_complete():
@@ -484,11 +497,12 @@ class TTSApp(ctk.CTk):
             self.pipeline.notify_playback_finished()
 
         try:
-            # Play synth file directly (no copy) — lower gap between sentences.
+            # Play synth file directly (no copy) — lower gap between batches.
             self.player.play(path, on_complete=on_complete)
         except Exception as e:
             self._status_var.set(f"Lỗi phát audio: {e}")
             on_complete()
+
 
 
 
@@ -547,8 +561,25 @@ class TTSApp(ctk.CTk):
         self.text_widget.tag_add("current", start, end)
         self.text_widget.see(start)
 
+    def _highlight_batch(self, start_idx: int, end_idx: int) -> None:
+        """Highlight all sentences in batch range [start_idx, end_idx)."""
+        if not self._sentences or start_idx >= end_idx:
+            return
+        start_idx = max(0, start_idx)
+        end_idx = min(end_idx, len(self._sentences))
+        if start_idx >= end_idx:
+            return
+        first = self._sentences[start_idx]
+        last = self._sentences[end_idx - 1]
+        self.text_widget.tag_remove("current", "1.0", "end")
+        start = self._char_index(first.start_char)
+        end = self._char_index(last.end_char)
+        self.text_widget.tag_add("current", start, end)
+        self.text_widget.see(start)
+
     def _clear_highlight(self) -> None:
         self.text_widget.tag_remove("current", "1.0", "end")
+
 
     def _selection_char_offset(self) -> Optional[int]:
         try:

@@ -1,4 +1,4 @@
-"""edge-tts pipeline: sentence-by-sentence with prefetch for smooth live playback."""
+"""edge-tts pipeline: batched sentences with prefetch for smooth live playback."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import uuid
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
+
 
 from app.sentence_splitter import Sentence
 
@@ -30,18 +31,20 @@ class TTSPipeline:
     """
     Shared pipeline for live playback and MP3 export.
 
-    LIVE mode prefetches upcoming sentences (each still one edge-tts request)
-    while the current sentence is playing, so transitions are nearly seamless.
+    LIVE mode prefetches upcoming *batches* (default 3 sentences per edge-tts
+    request) while the current batch is playing, so transitions are nearly seamless.
     """
 
     def __init__(
         self,
         temp_dir: Optional[Path] = None,
         prefetch_ahead: int = 2,
+        sentences_per_request: int = 3,
     ) -> None:
         self.temp_dir = Path(temp_dir or Path(tempfile.gettempdir()) / "edge_tts_app")
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         self.prefetch_ahead = max(1, prefetch_ahead)
+        self.sentences_per_request = max(1, sentences_per_request)
 
         self._state = PipelineState.IDLE
         self._lock = threading.Lock()
@@ -60,15 +63,16 @@ class TTSPipeline:
         self.export_path: Optional[str] = None
 
         # Callbacks (worker thread — GUI must marshal to main thread)
-        self.on_sentence_start: Optional[Callable[[int, Sentence], None]] = None
-        self.on_sentence_ready: Optional[Callable[[int, Sentence, str], None]] = None
+        # Live: start/end are sentence indices [start, end) for the current batch.
+        self.on_sentence_start: Optional[Callable[[int, int], None]] = None
+        self.on_sentence_ready: Optional[Callable[[int, int, str], None]] = None
         self.on_progress: Optional[Callable[[int, int], None]] = None
         self.on_export_done: Optional[Callable[[str], None]] = None
         self.on_done: Optional[Callable[[], None]] = None
         self.on_error: Optional[Callable[[str], None]] = None
         self.on_state_change: Optional[Callable[[str], None]] = None
 
-        # LIVE: wait until player finishes current sentence
+        # LIVE: wait until player finishes current batch audio
         self._playback_done = threading.Event()
         self._playback_done.set()
 
@@ -137,7 +141,7 @@ class TTSPipeline:
                 self._set_state(PipelineState.STOPPING)
 
     def seek_to(self, index: int) -> None:
-        """Jump to sentence index (live mode)."""
+        """Jump to sentence index (live mode). Playback continues from that sentence in batches."""
         with self._lock:
             if not self.sentences:
                 return
@@ -149,7 +153,7 @@ class TTSPipeline:
                 self._set_state(PipelineState.RUNNING)
 
     def notify_playback_finished(self) -> None:
-        """Called by GUI/player when current sentence audio finished."""
+        """Called by GUI/player when current batch audio finished."""
         self._playback_done.set()
 
     def _run_worker(self) -> None:
@@ -184,6 +188,23 @@ class TTSPipeline:
         name = f"tts_{uuid.uuid4().hex}{suffix}"
         return str(self.temp_dir / name)
 
+    # ── Batch helpers ─────────────────────────────────────────────
+
+    def _batch_end(self, start: int, total: Optional[int] = None) -> int:
+        """Exclusive end index for the batch beginning at *start*."""
+        if total is None:
+            total = len(self.sentences)
+        return min(start + self.sentences_per_request, total)
+
+    def _batch_text(self, start: int, end: int) -> str:
+        parts = [self.sentences[i].text.strip() for i in range(start, end)]
+        return " ".join(p for p in parts if p)
+
+    def _batch_label(self, start: int, end: int) -> str:
+        if end - start <= 1:
+            return f"câu {start + 1}"
+        return f"câu {start + 1}–{end}"
+
     # ── Prefetch buffer helpers ───────────────────────────────────
 
     def _clear_cache(
@@ -198,31 +219,35 @@ class TTSPipeline:
 
     async def _ensure_cached(
         self,
-        index: int,
+        start: int,
+        end: int,
         cache: Dict[int, str],
         inflight: Dict[int, asyncio.Task],
     ) -> Optional[str]:
-        """Return audio path for sentence index, synthesizing if needed."""
-        if index in cache:
-            return cache[index]
+        """Return audio path for batch [start, end), synthesizing if needed."""
+        if start in cache:
+            return cache[start]
 
-        if index in inflight:
+        if start in inflight:
             try:
-                path = await inflight[index]
+                path = await inflight[start]
                 return path
             except Exception:
                 return None
 
-        sentence = self.sentences[index]
+        text = self._batch_text(start, end)
+        if not text:
+            return None
         out_path = self._temp_file()
+        label = self._batch_label(start, end)
 
         async def _job() -> str:
-            await self._synthesize_to_file(sentence.text, out_path)
-            cache[index] = out_path
+            await self._synthesize_to_file(text, out_path)
+            cache[start] = out_path
             return out_path
 
         task = asyncio.create_task(_job())
-        inflight[index] = task
+        inflight[start] = task
         try:
             path = await task
             return path
@@ -230,12 +255,12 @@ class TTSPipeline:
             self._safe_unlink(out_path)
             if self.on_error:
                 try:
-                    self.on_error(f"Lỗi chuyển câu {index + 1}: {e}")
+                    self.on_error(f"Lỗi chuyển {label}: {e}")
                 except Exception:
                     pass
             return None
         finally:
-            inflight.pop(index, None)
+            inflight.pop(start, None)
 
     def _schedule_prefetch(
         self,
@@ -244,22 +269,39 @@ class TTSPipeline:
         cache: Dict[int, str],
         inflight: Dict[int, asyncio.Task],
     ) -> None:
-        """Kick off background synth for the next N sentences (non-blocking)."""
-        for j in range(from_index, min(from_index + self.prefetch_ahead, total)):
-            if j in cache or j in inflight:
+        """Kick off background synth for the next N batches (non-blocking)."""
+        batch_size = self.sentences_per_request
+        for b in range(self.prefetch_ahead):
+            start = from_index + b * batch_size
+            if start >= total:
+                break
+            if start in cache or start in inflight:
                 continue
-            sentence = self.sentences[j]
+            end = self._batch_end(start, total)
+            text = self._batch_text(start, end)
+            if not text:
+                continue
             out_path = self._temp_file()
+            label = self._batch_label(start, end)
 
-            async def _job(idx: int = j, path: str = out_path, text: str = sentence.text) -> str:
-                await self._synthesize_to_file(text, path)
+            async def _job(
+                idx: int = start,
+                path: str = out_path,
+                payload: str = text,
+            ) -> str:
+                await self._synthesize_to_file(payload, path)
                 cache[idx] = path
                 return path
 
             task = asyncio.create_task(_job())
-            inflight[j] = task
+            inflight[start] = task
 
-            def _done(t: asyncio.Task, idx: int = j, path: str = out_path) -> None:
+            def _done(
+                t: asyncio.Task,
+                idx: int = start,
+                path: str = out_path,
+                lbl: str = label,
+            ) -> None:
                 inflight.pop(idx, None)
                 try:
                     t.result()
@@ -268,7 +310,7 @@ class TTSPipeline:
                     cache.pop(idx, None)
                     if self.on_error:
                         try:
-                            self.on_error(f"Lỗi chuyển câu {idx + 1}: {e}")
+                            self.on_error(f"Lỗi chuyển {lbl}: {e}")
                         except Exception:
                             pass
 
@@ -285,23 +327,24 @@ class TTSPipeline:
     async def _live_loop(self) -> None:
         """
         Producer-consumer live loop:
-        - Prefetch next sentences while current one plays
-        - Each sentence = one edge-tts request
+        - Prefetch next batches while current one plays
+        - Each batch (default 3 sentences) = one edge-tts request
         """
         total = len(self.sentences)
         i = self.current_index
         cache: Dict[int, str] = {}
         inflight: Dict[int, asyncio.Task] = {}
+        batch_size = self.sentences_per_request
 
         try:
-            # Warm up: start synth for first sentence + lookahead immediately
+            # Warm up: start synth for first batch + lookahead immediately
             self._schedule_prefetch(i, total, cache, inflight)
 
             while i < total:
                 if self._stop_flag:
                     break
 
-                # Seek: drop buffer, jump
+                # Seek: drop buffer, jump to selected sentence (batches from there)
                 if self._seek_to is not None:
                     target = self._seek_to
                     self._seek_to = None
@@ -322,24 +365,24 @@ class TTSPipeline:
                 if self._seek_to is not None:
                     continue
 
-                sentence = self.sentences[i]
+                end = self._batch_end(i, total)
                 self.current_index = i
 
                 if self.on_sentence_start:
                     try:
-                        self.on_sentence_start(i, sentence)
+                        self.on_sentence_start(i, end)
                     except Exception:
                         pass
                 if self.on_progress:
                     try:
-                        self.on_progress(i + 1, total)
+                        self.on_progress(end, total)
                     except Exception:
                         pass
 
-                # Ensure this sentence audio is ready (await if still synthesizing)
-                out_path = await self._ensure_cached(i, cache, inflight)
+                # Ensure this batch audio is ready (await if still synthesizing)
+                out_path = await self._ensure_cached(i, end, cache, inflight)
                 if not out_path:
-                    i += 1
+                    i = end
                     self._schedule_prefetch(i, total, cache, inflight)
                     continue
 
@@ -348,14 +391,14 @@ class TTSPipeline:
                 if self._seek_to is not None:
                     continue
 
-                # Prefetch further while we play this one
-                self._schedule_prefetch(i + 1, total, cache, inflight)
+                # Prefetch further batches while we play this one
+                self._schedule_prefetch(i + batch_size, total, cache, inflight)
 
                 # Hand off to player
                 self._playback_done.clear()
                 if self.on_sentence_ready:
                     try:
-                        self.on_sentence_ready(i, sentence, out_path)
+                        self.on_sentence_ready(i, end, out_path)
                     except Exception as e:
                         if self.on_error:
                             self.on_error(str(e))
@@ -380,10 +423,14 @@ class TTSPipeline:
                 if self._seek_to is not None:
                     continue
 
-                i += 1
+                i = end
                 self.current_index = i
-                # Drop cache entries far behind (keep only upcoming)
-                keep = set(range(i, min(i + self.prefetch_ahead + 1, total)))
+                # Drop cache entries far behind (keep only upcoming batch starts)
+                keep: Set[int] = set()
+                for b in range(self.prefetch_ahead + 1):
+                    s = i + b * batch_size
+                    if s < total:
+                        keep.add(s)
                 self._clear_cache(cache, keep=keep)
                 self._schedule_prefetch(i, total, cache, inflight)
         finally:
@@ -392,27 +439,38 @@ class TTSPipeline:
 
     async def _export_loop(self) -> None:
         total = len(self.sentences)
-        paths: List[str] = []
+        if total == 0:
+            if self.on_error:
+                self.on_error("Không có đoạn audio nào được tạo.")
+            return
+
+        batch_size = self.sentences_per_request
+        # Batch starts: 0, 3, 6, ...
+        batch_starts = list(range(0, total, batch_size))
         # Parallel export with limited concurrency for speed
         sem = asyncio.Semaphore(3)
         results: Dict[int, str] = {}
 
-        async def synth_one(idx: int, sentence: Sentence) -> None:
+        async def synth_batch(start: int) -> None:
             async with sem:
                 if self._stop_flag:
                     return
+                end = self._batch_end(start, total)
+                text = self._batch_text(start, end)
+                if not text:
+                    return
                 out_path = self._temp_file()
+                label = self._batch_label(start, end)
                 try:
-                    await self._synthesize_to_file(sentence.text, out_path)
-                    results[idx] = out_path
+                    await self._synthesize_to_file(text, out_path)
+                    results[start] = out_path
                 except Exception as e:
                     self._safe_unlink(out_path)
                     if self.on_error:
-                        self.on_error(f"Lỗi chuyển câu {idx + 1}: {e}")
+                        self.on_error(f"Lỗi chuyển {label}: {e}")
 
-        # Progress UI: sequential start notifications + gather
         tasks = []
-        for i, sentence in enumerate(self.sentences):
+        for start in batch_starts:
             if self._stop_flag:
                 break
             while not self._pause_event.is_set():
@@ -422,18 +480,19 @@ class TTSPipeline:
             if self._stop_flag:
                 break
 
-            self.current_index = i
+            end = self._batch_end(start, total)
+            self.current_index = start
             if self.on_sentence_start:
                 try:
-                    self.on_sentence_start(i, sentence)
+                    self.on_sentence_start(start, end)
                 except Exception:
                     pass
             if self.on_progress:
                 try:
-                    self.on_progress(i + 1, total)
+                    self.on_progress(end, total)
                 except Exception:
                     pass
-            tasks.append(asyncio.create_task(synth_one(i, sentence)))
+            tasks.append(asyncio.create_task(synth_batch(start)))
 
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -443,10 +502,11 @@ class TTSPipeline:
                 self._safe_unlink(p)
             return
 
-        # Ordered paths
-        for i in range(total):
-            if i in results:
-                paths.append(results[i])
+        # Ordered paths by batch start
+        paths: List[str] = []
+        for start in batch_starts:
+            if start in results:
+                paths.append(results[start])
 
         if not paths:
             if self.on_error:
